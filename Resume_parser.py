@@ -1,15 +1,17 @@
 import streamlit as st
 import os
 import json
-import fitz  # PyMuPDF
+import fitz 
 import mysql.connector
 from groq import Groq
 from pydantic import BaseModel, Field
 from typing import List, Optional
 
-# --- 1. Pydantic Schema and Scoring Logic (From previous response) ---
+# --- 1. Pydantic Schema and Scoring Logic ---
 
 GROQ_MODEL = "llama-3.1-8b-instant"
+TABLE_NAME = "parsed_resumes"
+LOGS_TABLE_NAME = "parsing_logs" # Added for completeness
 
 class ResumeData(BaseModel):
     """Schema for structured data extraction from a resume."""
@@ -30,16 +32,18 @@ def calculate_resume_score(parsed_data: ResumeData, required_skills: List[str]) 
     score = 0.0
     
     # 1. Skill Match (40 points max)
-    skill_points_per_match = 40 / len(required_skills)
-    skill_match_score = 0
-    
-    parsed_skills_lower = [s.lower().strip() for s in parsed_data.skills_list]
-    
-    for skill in required_skills:
-        if any(skill.lower() == s for s in parsed_skills_lower):
-            skill_match_score += skill_points_per_match
-            
-    score += min(skill_match_score, 40)
+    # Avoid DivisionByZeroError if no required skills are entered
+    if required_skills:
+        skill_points_per_match = 40 / len(required_skills)
+        skill_match_score = 0
+        
+        parsed_skills_lower = [s.lower().strip() for s in parsed_data.skills_list]
+        
+        for skill in required_skills:
+            if any(skill.lower() == s for s in parsed_skills_lower):
+                skill_match_score += skill_points_per_match
+                
+        score += min(skill_match_score, 40)
     
     # 2. Experience Match (30 points max)
     target_experience = 5.0
@@ -69,7 +73,7 @@ def calculate_resume_score(parsed_data: ResumeData, required_skills: List[str]) 
     return round(final_score, 2)
 
 
-# --- 2. Utility Functions (Adapted for Streamlit) ---
+# --- 2. Utility Functions (Database & LLM) ---
 
 @st.cache_data
 def extract_text_from_pdf(uploaded_file):
@@ -98,33 +102,18 @@ def get_groq_client(api_key):
         return None
 
 def parse_resume_with_llm(client: Groq, resume_text: str):
-    """
-    Uses Groq's LLM to parse raw resume text into structured JSON.
+    """Uses Groq's LLM to parse raw resume text into structured JSON."""
     
-    Correction: Replaces 'response_json_schema' with 'response_format' and 
-    integrates schema instructions into the prompt.
-    """
-    
-    # 1. Define the required JSON structure directly in the prompt
-    JSON_SCHEMA_INSTRUCTIONS = """
-    You must respond ONLY with a single JSON object that strictly adheres to the following structure:
-    {
-      "name": "string",
-      "email": "string",
-      "phone": "string (or null if not found)",
-      "total_years_experience": "number (in years, e.g., 5.5. Use 0.0 if not found)",
-      "highest_degree": "string (e.g., 'M.S. in CS', 'B.Tech in ECE')",
-      "skills_list": "array of strings (e.g., ['Python', 'SQL', 'AWS'])"
-    }
-    """
+    JSON_SCHEMA_INSTRUCTIONS = ResumeData.model_json_schema()
     
     system_prompt = (
         "You are an expert resume parsing engine. Your task is to extract all requested fields "
-        "from the provided resume text into a perfectly valid JSON object. "
-        "Strictly adhere to the JSON format provided below. Do not include any text outside the JSON block."
+        "from the provided resume text into a perfectly valid JSON object that strictly adheres to the schema."
+        "Do not include any text outside the JSON block."
     )
     
-    user_prompt = f"{JSON_SCHEMA_INSTRUCTIONS}\n\n**Resume Text to Parse:**\n\n{resume_text}"
+    # Use Pydantic's schema for better reliability
+    user_prompt = f"Parse the following resume text into a JSON object strictly following this schema: {json.dumps(JSON_SCHEMA_INSTRUCTIONS)}\n\n**Resume Text to Parse:**\n\n{resume_text}"
 
     try:
         chat_completion = client.chat.completions.create(
@@ -133,7 +122,7 @@ def parse_resume_with_llm(client: Groq, resume_text: str):
                 {"role": "user", "content": user_prompt}
             ],
             model=GROQ_MODEL,
-            # CORRECT ARGUMENT: Use response_format for JSON output
+            # Correct argument: Use response_format for JSON output
             response_format={"type": "json_object"} 
         )
         
@@ -142,35 +131,70 @@ def parse_resume_with_llm(client: Groq, resume_text: str):
         return json.loads(json_content)
         
     except Exception as e:
-        # Note: If the LLM generates invalid JSON, json.loads() will raise an error here.
-        st.error(f"Error during LLM parsing or JSON decoding: {e}")
+        st.error(f"Error during LLM parsing or JSON decoding. Raw Error: {e}")
         return None
+
+# NEW FUNCTION: Initialize Database and Tables
+@st.cache_resource
+def initialize_database(db_config: dict):
+    """Checks for the DB and table, creating them if they don't exist."""
+    
+    # 1. Connect without specifying the DB name (to create it if needed)
     try:
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Parse the following resume text:\n\n{resume_text}"}
-            ],
-            model=GROQ_MODEL,
-            response_format={"type": "json_object"},
-            response_json_schema=ResumeData.model_json_schema()
-        )
+        # Temporarily remove 'database' key for initial connection
+        temp_config = db_config.copy()
+        db_name = temp_config.pop("database") 
+        conn = mysql.connector.connect(**temp_config)
+        cursor = conn.cursor()
         
-        json_content = chat_completion.choices[0].message.content
-        return json.loads(json_content)
+        st.info(f"Checking for database: **{db_name}**...")
         
-    except Exception as e:
-        st.error(f"Error during LLM parsing: {e}")
-        return None
+        # 2. Create Database if it doesn't exist
+        cursor.execute(f"CREATE DATABASE IF NOT EXISTS {db_name}")
+        
+        # 3. Switch to the newly created/existing database
+        cursor.execute(f"USE {db_name}")
+        
+        # 4. Create the main table
+        create_table_sql = f"""
+        CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            filename VARCHAR(255) NOT NULL,
+            name VARCHAR(255) NOT NULL,
+            email VARCHAR(255) UNIQUE NOT NULL, 
+            phone VARCHAR(50),
+            total_years_experience DECIMAL(4, 2),
+            highest_degree VARCHAR(100),
+            skills JSON,
+            job_description TEXT,
+            score DECIMAL(5, 2),
+            parsing_date DATETIME DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB;
+        """
+        cursor.execute(create_table_sql)
+
+        st.success(f"Database **'{db_name}'** and table **'{TABLE_NAME}'** confirmed/created.")
+        
+    except mysql.connector.Error as err:
+        st.error(f"❌ **FATAL DB Initialization Error:** Check Host/User/Password. Error: {err}")
+        return False
+    finally:
+        if 'conn' in locals() and conn.is_connected():
+            cursor.close()
+            conn.close()
+    return True
+
 
 def store_in_mysql(filename: str, parsed_data: ResumeData, job_description: str, score: float, db_config: dict):
     """Connects to MySQL and inserts the parsed data."""
+    conn = None
     try:
+        # Connect using the full config now that the DB/Table are confirmed
         conn = mysql.connector.connect(**db_config)
         cursor = conn.cursor()
         
-        sql = """
-        INSERT INTO parsed_resumes 
+        sql = f"""
+        INSERT INTO {TABLE_NAME} 
         (filename, name, email, phone, total_years_experience, highest_degree, skills, job_description, score) 
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
@@ -192,9 +216,9 @@ def store_in_mysql(filename: str, parsed_data: ResumeData, job_description: str,
         st.success(f"**✅ Database Save:** Data for **{filename}** stored with score **{score}**.")
         
     except mysql.connector.Error as err:
-        st.error(f"❌ **MySQL Database Error:** Could not save data. Please check connection details. Error: {err}")
+        st.error(f"❌ **MySQL Save Error:** Could not save data. Error: {err}")
     finally:
-        if 'conn' in locals() and conn.is_connected():
+        if conn and conn.is_connected():
             cursor.close()
             conn.close()
 
@@ -212,9 +236,10 @@ with st.sidebar:
     groq_api_key = st.text_input("Groq API Key", type="password")
     
     st.subheader("⚙️ MySQL Database Settings")
+    st.warning("Ensure the MySQL server is running and accessible.")
     db_host = st.text_input("Host", "localhost")
-    db_user = st.text_input("User", "your_mysql_user") # CHANGE THIS
-    db_password = st.text_input("Password", "your_mysql_password", type="password") # CHANGE THIS
+    db_user = st.text_input("User", "root") # Default MySQL User
+    db_password = st.text_input("Password", type="password") # Must be provided
     db_name = st.text_input("Database Name", "resume_parser_db")
 
     db_config = {
@@ -224,6 +249,15 @@ with st.sidebar:
         "database": db_name
     }
     
+    # Initialize the database immediately upon connecting/reloading
+    if st.button("Initialize/Check Database Connection"):
+        if initialize_database(db_config):
+            st.success("Database connection successful and schema is ready!")
+        else:
+            st.error("Database initialization failed. Check credentials and server status.")
+
+st.markdown("---")
+
 # --- Main Content ---
 col1, col2 = st.columns(2)
 
@@ -244,7 +278,7 @@ with col2:
     
     required_skills_input = st.text_input(
         "**Key Skills for Scoring (Comma-separated)**",
-        "Python, Django, AWS, MySQL, PostgreSQL, REST API",
+        "Python, Django, AWS, MySQL, REST API",
         help="These are the critical skills used to calculate the Skill Match score."
     )
     required_skills = [s.strip() for s in required_skills_input.split(',') if s.strip()]
@@ -259,35 +293,37 @@ if st.button("🚀 **Analyze & Score Resume**", type="primary", use_container_wi
         st.warning("Please upload a PDF resume.")
     elif not required_skills:
         st.warning("Please specify at least one key skill for accurate scoring.")
+    elif not initialize_database(db_config): # Check DB again before running the main logic
+         st.error("Database connection failed. Cannot proceed with analysis.")
     else:
         # Use a Streamlit spinner for visual feedback
         with st.spinner('Parsing resume with Groq and calculating score...'):
             
-            # Get Groq client
+            # 1. Get Groq client
             groq_client = get_groq_client(groq_api_key)
             if not groq_client:
                 st.stop()
             
-            # 1. Extraction
+            # 2. Extraction
             raw_text = extract_text_from_pdf(uploaded_file)
             
-            # 2. LLM Parsing
+            # 3. LLM Parsing
             parsed_json = parse_resume_with_llm(groq_client, raw_text)
             
             if not parsed_json:
                 st.error("LLM failed to produce valid data. Please try another resume.")
                 st.stop()
             
-            # 3. Validation and Scoring
+            # 4. Validation and Scoring
             try:
                 parsed_data = ResumeData.model_validate(parsed_json)
                 final_score = calculate_resume_score(parsed_data, required_skills)
             except Exception as e:
-                st.error(f"Data validation error: {e}")
+                st.error(f"Data validation error (Pydantic): The LLM output did not match the required schema. Error: {e}")
                 st.json(parsed_json) # Show the raw LLM output for debugging
                 st.stop()
             
-            # 4. Display Results
+            # 5. Display Results
             st.success("✅ Analysis Complete!")
             
             score_col, name_col, email_col = st.columns(3)
@@ -300,7 +336,7 @@ if st.button("🚀 **Analyze & Score Resume**", type="primary", use_container_wi
 
             st.markdown("### 📋 Extracted Details")
             
-            # Display Extracted Fields in a table or structured format
+            # Display Extracted Fields
             data_summary = {
                 "Phone": parsed_data.phone or "N/A",
                 "Years Experience": parsed_data.total_years_experience,
@@ -309,17 +345,15 @@ if st.button("🚀 **Analyze & Score Resume**", type="primary", use_container_wi
             }
             st.json(data_summary)
             
-            # 5. Database Storage
+            # 6. Database Storage
             store_in_mysql(uploaded_file.name, parsed_data, job_description, final_score, db_config)
-
-# --- Instructions to Run ---
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### How to Run This App")
 st.sidebar.markdown(
     """
-    1.  **Install Dependencies:** `pip install streamlit groq pydantic PyMuPDF mysql-connector-python`
-    2.  **Set Up MySQL:** Execute the SQL code from the previous response to create the `parsed_resumes` table.
-    3.  **Run:** `streamlit run app.py`
+    1. **Install Dependencies:** `pip install streamlit groq pydantic PyMuPDF mysql-connector-python`
+    2. **Start MySQL Server:** Ensure your local or remote MySQL server is running.
+    3. **Run:** `streamlit run app.py` (or whatever you name your file)
     """
 )
